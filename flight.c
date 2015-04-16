@@ -70,6 +70,8 @@ char timecmp(flight_time t1, flight_time t2){
 
 /* Конвертирует структуру рейса в строку */
 char* flight_to_string(flight* f){
+	if(f->string_repr[0]!='\0')
+		return f->string_repr;
 	char days_str[FORM_STR_LEN];
 	char time_from_str[TIME_STR_LEN], time_to_str[TIME_STR_LEN];
 	int pos;
@@ -112,5 +114,6 @@ flight* make_flight(char* number_str,
 	f->time_from = string_to_time(time_from);
 	f->time_to = string_to_time(time_to);
 	f->cost = atoi(cost);
+	f->string_repr[0]='\0';
 	return f;
 }

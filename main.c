@@ -3,6 +3,8 @@
 #include <string.h>
 #include <locale.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <ncursesw/curses.h>
 #include <ncursesw/menu.h>
 #include <ncursesw/panel.h>
@@ -12,9 +14,12 @@
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 #define MENU_PAGE_ITEMS 16 // маскимальное количество отображаемых элементов меню
 #define ESCAPE 27
+#define DB_FILENAME "db.txt"
 
 typedef enum { in_main, in_form, some_error } program_state;
-static flight_table table;
+FILE * db_file;
+flight tmp;
+int records_count;
 
 WINDOW * err_win;
 PANEL * err_panel;
@@ -29,8 +34,14 @@ void init_all();
 void free_all();
 /* Удаление записи из таблицы */
 void del_flight(int id);
+/* Добавление записи в таблицу */
+void add_flight(flight f);
+/* Изменение записи таблицы */
+void change_flight(int id, flight f);
+/* Получение записи таблицы */
+flight get_flight(int id);
 /* Проверка, подходит ли запись под запрос */
-char fits_query(flight* f, flight* query);
+char fits_query(flight f, flight* query);
 /* Создаёт окно главного меню. */
 int show_main_menu();
 /* Создание окна, в котором будет показываться ошибка */
@@ -63,48 +74,71 @@ void init_all(){
 	curs_set(0);
 	keypad(stdscr, TRUE);
 	create_error_message_window();
-	table.size = 0;
+	if ((db_file = fopen(DB_FILENAME, "r+")) == NULL){
+		db_file = fopen(DB_FILENAME, "w+");
+	}
+	fseek(db_file, 0, SEEK_END);
+	records_count = ftell(db_file)/sizeof(flight);
 	filter_query = NULL;
 }
 
 /* Освобождение всего, что нужно */
 void free_all(){
-	int i;
-	for(i = 0; i < table.size; ++i){
-		free(table.arr[i]);
-	}
+	fclose(db_file);
 	endwin();
 }
 
 /* Удаление записи из таблицы */
 void del_flight(int id){
-	int i;
-	free(table.arr[id]);
-	for(i = id; i < table.size - 1; ++i){
-		table.arr[i] = table.arr[i+1];
+	fseek(db_file, sizeof(flight)*(id+1), SEEK_SET);
+	while(fread(&tmp, sizeof(flight), 1, db_file)==1){
+		fseek(db_file, -2*sizeof(flight), SEEK_CUR);
+		fwrite(&tmp, sizeof(flight), 1, db_file);
+		fseek(db_file, sizeof(flight), SEEK_CUR);
 	}
-	table.size--;
+	records_count--;
+	ftruncate(fileno(db_file), sizeof(flight)*records_count);
+}
+/* Добавление записи в таблицу */
+void add_flight(flight f){
+	fseek(db_file, 0, SEEK_END);
+	fwrite(&f, sizeof(flight), 1, db_file);
+	records_count++;
+}
+
+/* Изменение записи таблицы */
+void change_flight(int id, flight f){
+	fseek(db_file, sizeof(flight)*id, SEEK_SET);
+	fwrite(&f, sizeof(flight), 1, db_file);
+}
+
+/* Получение записи таблицы */
+flight get_flight(int id){
+	flight f;
+	fseek(db_file, sizeof(flight)*id, SEEK_SET);
+	fread(&f, sizeof(flight), 1, db_file);
+	return f;
 }
 
 /* Проверка, подходит ли запись под запрос */
-char fits_query(flight* f, flight* query){
+char fits_query(flight f, flight* query){
 	const char empty_field_str[] = "                "; // FORM_STR_LEN  пробелов
 	char result = 1;
 	if(query != NULL){
 		if(query->number != 0)
-			result = result && f->number == query->number;
+			result = result && f.number == query->number;
 		if(strcmp(query->airplane_name, empty_field_str) != 0)
-			result = result && strcmp(f->airplane_name, query->airplane_name) == 0;
+			result = result && strcmp(f.airplane_name, query->airplane_name) == 0;
 		if(strcmp(query->city_name, empty_field_str) != 0)
-			result = result && strcmp(f->city_name, query->city_name) == 0;
+			result = result && strcmp(f.city_name, query->city_name) == 0;
 		if(query->days != 0)
-			result = result && (f->days & query->days);
+			result = result && (f.days & query->days);
 		if(query->time_from.hour > -1)
-			result = result && timecmp(query->time_from, f->time_from) >= 0;
+			result = result && timecmp(query->time_from, f.time_from) >= 0;
 		if(query->time_to.hour > -1)
-			result = result && timecmp(query->time_to, f->time_to) >= 0;
+			result = result && timecmp(query->time_to, f.time_to) >= 0;
 		if(query->cost != 0)
-			result = result && f->cost <= query->cost;
+			result = result && f.cost <= query->cost;
 	}
 	return result;
 }
@@ -118,11 +152,19 @@ int show_main_menu(){
 	int c, real_menu_size=0;
 	intptr_t i;
 	char* caption = "Расписание самолётов";
+	static char (*string_items)[UTF_STRING_REPR_LEN] =NULL;
+	if(string_items != NULL){
+		free(string_items);
+	}
+	string_items = malloc(sizeof(char)*UTF_STRING_REPR_LEN*records_count);
 	/* Создание меню */
-	items = malloc(sizeof(ITEM*)*table.size+1);
-	for(i = 0; i < table.size; ++i){
-		if(fits_query(table.arr[i], filter_query)){
-			items[real_menu_size] = new_item(flight_to_string(table.arr[i]), NULL);
+	items = malloc(sizeof(ITEM*)*records_count+1);
+	fseek(db_file, 0, SEEK_SET);
+	for(i = 0; i < records_count; ++i){
+		fread(&tmp, sizeof(flight), 1, db_file);
+		if(fits_query(tmp, filter_query)){
+			strcpy(string_items[i], flight_to_string(&tmp));
+			items[real_menu_size] = new_item(string_items[i], NULL);
 			set_item_userptr(items[real_menu_size], (void*)i);
 			real_menu_size++;
 		}
@@ -167,13 +209,14 @@ int show_main_menu(){
 			hide_panel(main_menu_panel);
 			record = get_form_data(NULL, 0);
 			if(record){
-				table.arr[table.size++] = record;
+				add_flight(*record);
+				free(record);
 				cycle = 0;
 			}	
 			top_panel(main_menu_panel);		
 			break;
 			case 'd': case 'D':
-			if(table.size == 0)
+			if(records_count == 0)
 				show_error_message("Нечего удалять");
 			else {
 				del_flight((intptr_t)item_userptr(items[selected]));
@@ -181,22 +224,23 @@ int show_main_menu(){
 			}
 			break;
 			case 'e': case 'E':
-			if(table.size == 0)
+			if(records_count == 0)
 				show_error_message("Нечего редактировать");
 			else {
 				hide_panel(main_menu_panel);
 				i = (intptr_t)item_userptr(items[selected]);
-				record = get_form_data(table.arr[i], 0);
+				tmp = get_flight(i);
+				record = get_form_data(&tmp, 0);
 				if(record){
-					free(table.arr[i]);
-					table.arr[i] = record;
+					change_flight(i, *record);
+					free(record);
 					cycle = 0;
 				}
 				top_panel(main_menu_panel);
 			}
 			break;
 			case 'q': case 'Q':
-			if(table.size == 0)
+			if(records_count == 0)
 				show_error_message("Нет записей для выполнения запроса");
 			else {
 				hide_panel(main_menu_panel);
@@ -409,7 +453,7 @@ void show_error_message(char* msg){
 
 /* Печать инструкций управления и информации о записях */
 void print_info(program_state state){
-	mvprintw(LINES - 3, 0, "Записей на текущий момент: %d", table.size);
+	mvprintw(LINES - 3, 0, "Записей на текущий момент: %d", records_count);
 	switch(state){
 		case in_main:
 		mvprintw(LINES - 2, 0, "Стрелки - выбирать пункты, A - добавить запись, E - редактировать запись, D - удалить запись, Q - сделать запрос, C - очистить текущий запрос, Esc - выход");
